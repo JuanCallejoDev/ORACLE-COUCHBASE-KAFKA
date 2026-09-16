@@ -1,0 +1,16 @@
+{
+    "name": "couchbase-sink",
+    "config": {
+        "connector.class": "com.couchbase.connect.kafka.CouchbaseSinkConnector",
+        "tasks.max": "1",
+        "topics": "ORDER_TO_SHIP",
+        "couchbase.seed.nodes": "couchbase",
+        "couchbase.bucket": "order-address-client",
+        "couchbase.username": "Administrator",
+        "couchbase.password": "215123",
+        "key.converter": "org.apache.kafka.connect.converters.LongConverter",
+        "value.converter": "io.confluent.connect.avro.AvroConverter",
+        "value.converter.schema.registry.url": "http://schema-registry:8081",
+        "value.converter.schemas.enable": "false"
+    }
+}

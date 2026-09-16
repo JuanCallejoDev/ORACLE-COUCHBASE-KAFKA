@@ -1,0 +1,20 @@
+{
+    "name": "oracle-source-v2",
+    "config": {
+        "connector.class": "io.debezium.connector.oracle.OracleConnector",
+        "tasks.max": "1",
+        "database.hostname": "oracle",
+        "database.port": "1521",
+        "database.user": "c##dbzuser",
+        "database.password": "dbz",
+        "database.dbname": "XE",
+        "database.pdb.name": "XEPDB1",
+        "topic.prefix": "oracle-server-v2",
+        "schema.include.list": "DEBEZIUM",
+        "table.include.list": "DEBEZIUM.CUSTOMERS",
+        "schema.history.internal.kafka.bootstrap.servers": "broker:29092",
+        "schema.history.internal.kafka.topic": "schema-changes.oracle-v2",
+        "snapshot.mode": "initial",
+        "log.mining.strategy": "online_catalog"
+    }
+}

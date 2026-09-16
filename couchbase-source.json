@@ -1,0 +1,15 @@
+{
+    "name": "couchbase-source",
+    "config": {
+        "connector.class": "com.couchbase.connect.kafka.CouchbaseSourceConnector",
+        "tasks.max": "1",
+        "couchbase.seed.nodes": "couchbase",
+        "couchbase.bucket": "order-address-client",
+        "couchbase.username": "Administrator",
+        "couchbase.password": "215123",
+        "couchbase.topic": "COUCHBASE_ORDER_UPDATES",
+        "couchbase.source.handler": "com.couchbase.connect.kafka.handler.source.RawJsonSourceHandler",
+        "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+        "value.converter": "org.apache.kafka.connect.converters.ByteArrayConverter"
+    }
+}
