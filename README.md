@@ -26,6 +26,8 @@ sintaxis actualizada a las versiones actuales de Debezium (2.4) y ksqlDB
 7. [Sink a Couchbase (Parte 3)](#sink-a-couchbase-parte-3)
    - [Vía inversa: Couchbase → Kafka](#vía-inversa-couchbase--kafka)
    - [Limitación conocida: DELETE no se propaga](#limitación-conocida-los-delete-en-oracle-no-se-propagan-hasta-couchbase)
+   - [Rediseño: propagar el DELETE hasta Couchbase](#rediseño-propagar-el-dato-de-un-delete-hasta-couchbase)
+   - [Borrado físico real: documento por pedido](#borrado-físico-real-pipeline-documento-por-pedido)
 8. [Migración de Docker Desktop a Docker Engine en WSL](#migración-de-docker-desktop-a-docker-engine-en-wsl)
 9. [Catálogo de problemas mayores y soluciones](#catálogo-de-problemas-mayores-y-soluciones)
 10. [Próximos pasos](#próximos-pasos)
@@ -300,6 +302,194 @@ evento de borrado explícito hacia Couchbase (por ejemplo, produciendo un
 mensaje con valor `null` a la clave correspondiente). No implementado en
 esta práctica — queda como mejora futura.
 
+### Rediseño: propagar el dato de un DELETE hasta Couchbase
+
+Se construyó un **pipeline paralelo** (sin tocar el original) que sí
+propaga el dato de un `DELETE` de punta a punta, usando la transformación
+idiomática de Debezium para este problema: `ExtractNewRecordState` en modo
+`rewrite`.
+
+```mermaid
+flowchart LR
+    O[(Oracle: tabla ORDERS)]
+    O -- LogMiner --> DBZ[oracle-source-flat]
+    DBZ -- "unwrap (rewrite) + route" --> TF[[topic: ORDERS_FLAT]]
+    TF --> REKEY[ORDERS_FLAT_REKEY]
+    REKEY --> JOIN[order_to_ship_flat]
+    ADDR[ADDRESSES_CLEAN] --> JOIN
+    JOIN --> TOP[[topic: ORDER_TO_SHIP_FLAT]]
+    TOP --> SINK[couchbase-sink-flat-v2]
+    SINK -->|"doc id: flat-${'/CUSTOMER_ID'}"| CB[(Couchbase\nflat-1001, flat-1002, flat-1003)]
+```
+
+**Conector `oracle-source-flat.json`** — captura solo `DEBEZIUM.ORDERS`, con
+dos transformaciones encadenadas:
+
+```json
+"transforms": "unwrap,route",
+"transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+"transforms.unwrap.delete.handling.mode": "rewrite",
+"transforms.unwrap.drop.tombstones": "false",
+"transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+"transforms.route.regex": "([^.]+)\\.([^.]+)\\.([^.]+)",
+"transforms.route.replacement": "$3_FLAT"
+```
+
+`delete.handling.mode: rewrite` es la clave: en vez de dejar `after: null`
+en un borrado, **reescribe el registro usando el estado `before`** (los
+valores de la fila justo antes de eliminarse) y añade un campo `__deleted:
+"true"`. Esto significa que la clave de negocio (`PURCHASER`) sobrevive al
+borrado — a diferencia del pipeline original, donde se perdía por completo.
+El resultado son registros **planos** en el topic `ORDERS_FLAT` (sin el
+struct `after` anidado), con tipos `BIGINT` para los numéricos (por el
+tamaño de `NUMBER(10)` en Oracle) y `VARCHAR` para `__deleted`.
+
+**Pipeline ksqlDB equivalente**, replicando `ORDERS_REKEY`/`order_to_ship`
+pero sobre los datos planos:
+
+```sql
+CREATE STREAM orders_flat (
+  ORDER_NUMBER BIGINT, ORDER_DATE BIGINT, PURCHASER BIGINT,
+  QUANTITY BIGINT, PRODUCT_ID BIGINT, __deleted VARCHAR
+) WITH (KAFKA_TOPIC='ORDERS_FLAT', VALUE_FORMAT='AVRO');
+
+CREATE STREAM ORDERS_FLAT_REKEY AS
+SELECT ORDER_NUMBER, ORDER_DATE, PURCHASER, QUANTITY, PRODUCT_ID, __deleted
+FROM orders_flat
+PARTITION BY PURCHASER;
+
+CREATE STREAM order_to_ship_flat AS
+SELECT o.PURCHASER, o.ORDER_NUMBER, o.ORDER_DATE, (o.PURCHASER + 0) AS CUSTOMER_ID,
+       o.QUANTITY, o.PRODUCT_ID, o.__deleted,
+       a.STREET, a.CITY, a.STATE, a.ZIP, a.TYPE
+FROM ORDERS_FLAT_REKEY o
+LEFT JOIN ADDRESSES_CLEAN a ON o.PURCHASER = a.CUSTOMER_ID;
+```
+
+**Hallazgo importante sobre columnas de clave en ksqlDB:** una columna que
+es la *clave* de un stream (como `PURCHASER`, resultado de un `PARTITION
+BY`) sigue tratándose como columna de clave en todas las transformaciones
+posteriores, **incluso si le pones un alias distinto** — nunca se serializa
+dentro del cuerpo (`value`) del mensaje, solo como `key` de Kafka. Esto
+importa porque `couchbase.document.id` (ver más abajo) solo puede leer
+campos del *cuerpo*, nunca la clave. La solución fue forzar un cálculo
+trivial que rompe ese seguimiento: `(o.PURCHASER + 0) AS CUSTOMER_ID` — la
+suma obliga a ksqlDB a tratarlo como un valor calculado real, que sí queda
+en el cuerpo. ksqlDB además exige que la columna de clave original del
+`JOIN` (`o.PURCHASER`) siga presente tal cual en el `SELECT`, aunque ya
+tengas la copia calculada.
+
+**Conector `couchbase-sink-flat-v2.json`:**
+
+```json
+"couchbase.document.id": "flat-${/CUSTOMER_ID}",
+"key.converter": "org.apache.kafka.connect.converters.LongConverter",
+"consumer.override.auto.offset.reset": "earliest"
+```
+
+`couchbase.document.id` usa sintaxis de **JSON Pointer** (`${/campo}`) para
+referenciar campos del *cuerpo* del mensaje — no existe una forma de
+referenciar directamente la clave de Kafka con un placeholder tipo
+`${key}`; si no se especifica esta propiedad, el conector usa la clave tal
+cual. El prefijo `flat-` en los IDs de documento (`flat-1001`, `flat-1002`,
+`flat-1003`) evita colisionar con los documentos del pipeline original
+(`1001`, `1002`, `1003`).
+
+**Resultado final verificado:** el documento `flat-1002` en Couchbase
+contiene el pedido `10005` (el mismo que se borró de verdad en Oracle) con
+`"__DELETED":"true"` y la dirección de envío completamente resuelta — el
+dato del borrado llega íntegro hasta el final del pipeline, resolviendo el
+problema de raíz documentado en la sección anterior.
+
+**Incidente durante la construcción (y cómo se resolvió):** un primer
+intento de `couchbase.document.id` usando `${/PURCHASER}` sin la corrección
+del `+0` no encontró ese campo en el cuerpo (por el motivo explicado
+arriba), y el conector cayó de vuelta silenciosamente a usar la clave de
+Kafka tal cual — que coincidía con los IDs del pipeline original (`1001`,
+`1002`, `1003`), **sobrescribiendo temporalmente esos documentos** con los
+datos del pipeline flat. Se restauraron registrando un conector temporal
+(mismo `key.converter`, mismo topic `ORDER_TO_SHIP`,
+`consumer.override.auto.offset.reset=earliest`) que releyó el historial
+completo y reconstruyó el estado correcto, antes de borrarlo. Lección: al
+introducir un `couchbase.document.id` personalizado, conviene verificar
+primero con `PRINT` que el campo referenciado realmente aparece en el
+cuerpo del mensaje, antes de apuntar el sink a un bucket con datos ya en
+uso.
+
+### Borrado físico real: pipeline "documento por pedido"
+
+El pipeline `_flat` propaga el *dato* de un borrado (`__deleted: true`),
+pero nunca elimina el documento en sí — para eso Couchbase necesita recibir
+un mensaje con **valor `null`** (un *tombstone* real), y **ksqlDB no tiene
+forma de producir eso** desde un `JOIN` o un `SELECT` (solo puede poner
+campos individuales a `null`, nunca el mensaje completo). La solución fue
+cambiar de modelo: en vez de "un documento por cliente con dirección
+resuelta", **un documento por pedido, espejo 1:1 de la fila de Oracle**, sin
+pasar por ksqlDB en absoluto — solo dos conectores encadenados.
+
+```mermaid
+flowchart LR
+    O[(Oracle: tabla ORDERS)]
+    O -- LogMiner --> DBZ[oracle-source-orders-doc-v3]
+    DBZ -- "unwrap (drop) + extractKey + route" --> TOP[[topic: ORDERS_DOC_V3]]
+    TOP --> SINK[couchbase-sink-orders-doc]
+    SINK -->|"doc id = clave de Kafka (10001, 10002...)"| CB[(Couchbase\n10001, 10002, 10003...)]
+```
+
+**Conector `oracle-source-orders-doc-v3.json`:**
+
+```json
+"transforms": "unwrap,extractKey,route",
+"transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+"transforms.unwrap.delete.handling.mode": "drop",
+"transforms.unwrap.drop.tombstones": "false",
+"transforms.extractKey.type": "org.apache.kafka.connect.transforms.ExtractField$Key",
+"transforms.extractKey.field": "ORDER_NUMBER",
+"errors.tolerance": "all",
+"errors.log.enable": "true"
+```
+
+Diferencias clave frente al pipeline `_flat`:
+
+- **`delete.handling.mode: "drop"`** (el valor por defecto de Debezium) en
+  vez de `rewrite` — este modo sí produce un valor `null` real en el
+  borrado, justo lo que necesita Couchbase para interpretar un borrado
+  físico.
+- **`ExtractField$Key`** — transformación estándar de Kafka Connect (no de
+  Debezium) que convierte la clave nativa de Debezium (una estructura
+  compuesta, `Struct{ORDER_NUMBER=10001}`) en un valor simple
+  (`10001`), listo para usar directamente como ID de documento sin más
+  transformaciones.
+- **`errors.tolerance: "all"`** — un registro concreto (de origen no
+  identificado, probablemente un evento interno puntual) hacía fallar
+  `ExtractField$Key` con `Unknown field: ORDER_NUMBER`, aunque se comprobó
+  con un conector de diagnóstico que las estructuras de clave de los
+  pedidos reales sí tenían ese campo correctamente. Con `errors.tolerance:
+  all`, la tarea salta ese registro puntual en vez de morir, y los pedidos
+  reales se procesan sin problema.
+
+**Conector `couchbase-sink-orders-doc.json`:** sin `couchbase.document.id`
+personalizado — usa la clave de Kafka tal cual (`10001`, `10002`...) como
+ID de documento. No hay colisión con los IDs de los otros dos pipelines
+(`1001`-`1004` de clientes, `flat-1001`... del pipeline flat) porque los
+números de pedido tienen 5 cifras.
+
+**Resultado verificado en vivo:** al borrar el pedido `10004` en Oracle
+(`DELETE FROM orders WHERE order_number = 10004; COMMIT;`), el documento
+`10004` **desapareció por completo** del bucket de Couchbase — de 10
+documentos totales a 9 — confirmando un borrado físico real de punta a
+punta, no solo un marcador. En paralelo, el pipeline `_flat` capturó el
+mismo evento y actualizó `flat-1003` con `__DELETED: "true"`, demostrando
+que ambas estrategias conviven sin interferirse, cada una capturando el
+mismo cambio real de Oracle a su manera.
+
+**Trade-off aceptado:** este modelo no incluye la dirección de envío
+resuelta (no pasa por el `JOIN` con `ADDRESSES_CLEAN`) — es un espejo
+directo de la tabla `orders`, no un documento de negocio enriquecido. Sirve
+como demostración de que el borrado físico es alcanzable con Kafka Connect
+puro, a costa de renunciar al enriquecimiento vía ksqlDB para ese caso de
+uso concreto.
+
 ## Migración de Docker Desktop a Docker Engine en WSL
 
 Se detectaron problemas de estabilidad (contenedores caídos, conflictos de
@@ -320,14 +510,34 @@ el de Docker Desktop.
 | El sink de Couchbase colisionaba distintos clientes en un solo documento | `key.converter: StringConverter` sobre una clave `BIGINT` binaria corrompe el valor | Usar `key.converter: LongConverter` |
 | El sink de Couchbase no reprocesaba mensajes tras corregir la config | Reutilizar el mismo nombre de conector reutiliza su *consumer group*, retomando desde el final del topic | Registrar con nombre nuevo (`couchbase-sink-v2`) y `consumer.override.auto.offset.reset=earliest` |
 | Build de Couchbase fallaba (`apt-get: command not found`) | La imagen base de `cp-kafka-connect` no es Debian/Ubuntu, no tiene `apt-get` | Usar `jar -xf` (incluido en el JDK) para descomprimir el `.zip` del conector, en vez de `unzip` |
-| Un `DELETE` en Oracle no llega a Couchbase | Los streams solo capturan `after` (null en un delete); Kafka Streams descarta registros con clave `null` en un `JOIN` stream-tabla, silenciosamente | No resuelto — limitación conocida, documentada arriba; requeriría capturar `before`/`op` para manejarlo |
+| Un `DELETE` en Oracle no llega a Couchbase (pipeline original) | Los streams solo capturan `after` (null en un delete); Kafka Streams descarta registros con clave `null` en un `JOIN` stream-tabla, silenciosamente | **Resuelto en un pipeline paralelo** (`oracle-source-flat` → `ORDERS_FLAT` → ... → `couchbase-sink-flat-v2`) usando `ExtractNewRecordState` en modo `rewrite`; el pipeline original (`ORDER_TO_SHIP`) se dejó sin modificar |
+| `couchbase.document.id` personalizado no encontraba el campo esperado y sobrescribió documentos existentes | El campo era en realidad la *clave* del stream (no un campo del cuerpo), y `couchbase.document.id` solo lee JSON Pointer contra el cuerpo; al no encontrarlo, el conector usó la clave de Kafka tal cual, coincidiendo con IDs ya en uso | Duplicar la clave como columna calculada con `(campo + 0) AS ALIAS` para forzar que quede en el cuerpo; verificar con `PRINT` antes de apuntar un sink a un bucket con datos existentes |
+| `ExtractField$Key` fallaba con `Unknown field: ORDER_NUMBER` de forma intermitente | Un registro puntual (origen no identificado) no traía ese campo en la clave, aunque los pedidos reales sí lo tenían (confirmado con un conector de diagnóstico sin la transformación) | Añadir `errors.tolerance: "all"` para que la tarea salte ese registro puntual en vez de morir por completo |
 
 ## Próximos pasos
 
+- Aplicar el mismo patrón de documento-por-fila (`ExtractField$Key` +
+  `delete.handling.mode: drop`) a `ADDRESSES`, si se quiere borrado físico
+  real también para direcciones.
+- Considerar unificar los tres pipelines de Couchbase en uno solo con
+  lógica más rica (por ejemplo, un consumidor de aplicación que lea el
+  flag `__deleted` del pipeline `_flat` y decida cuándo emitir un borrado
+  físico), en vez de mantenerlos como demostraciones paralelas
+  independientes.
 - Limpiar el documento residual con ID corrupto que quedó en Couchbase del
-  conector con la configuración antigua.
-- Probar `INSERT`/`DELETE` (no solo `UPDATE`) de punta a punta hasta
-  Couchbase.
-- Considerar un `couchbase.document.id` explícito si se quiere un esquema de
-  documento distinto (por ejemplo, un documento por pedido en vez de por
-  cliente).
+  conector con la configuración antigua (antes de introducir
+  `LongConverter`).
+- **Rendimiento de WSL2 con este stack.** Con 3 conectores Debezium
+  distintos haciendo LogMiner sobre la misma tabla en paralelo, más Oracle,
+  Kafka, Couchbase y Control Center simultáneos, `VmmemWSL` (el proceso de
+  la VM de WSL2) puede llegar a consumir varios GB de RAM y generar
+  bastante I/O de disco sostenido, ralentizando el resto del sistema
+  Windows. Mitigaciones aplicadas: mover el proyecto del filesystem de
+  Windows (`/mnt/c/...`) al filesystem nativo de Linux dentro de WSL2
+  (`~/...`), y parar servicios no usados activamente (`docker compose stop
+  akhq control-center ksql-datagen`) cuando no se necesitan. Pendiente:
+  considerar limitar la memoria de WSL2 vía `.wslconfig`, o aumentar el
+  tamaño de los redo logs de Oracle (aviso visto en los logs: "Redo logs
+  may be sized too small... consider increasing redo log sizes to a
+  minimum of 500MB") para reducir la frecuencia de cambios de log bajo
+  carga de varios conectores LogMiner concurrentes.

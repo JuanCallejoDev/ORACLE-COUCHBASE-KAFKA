@@ -1,0 +1,27 @@
+{
+    "name": "oracle-source-orders-doc-debug",
+    "config": {
+        "connector.class": "io.debezium.connector.oracle.OracleConnector",
+        "tasks.max": "1",
+        "database.hostname": "oracle",
+        "database.port": "1521",
+        "database.user": "c##dbzuser",
+        "database.password": "dbz",
+        "database.dbname": "XE",
+        "database.pdb.name": "XEPDB1",
+        "topic.prefix": "oracle-doc-debug",
+        "schema.include.list": "DEBEZIUM",
+        "table.include.list": "DEBEZIUM.ORDERS",
+        "schema.history.internal.kafka.bootstrap.servers": "broker:29092",
+        "schema.history.internal.kafka.topic": "schema-changes.oracle-doc-debug",
+        "snapshot.mode": "initial",
+        "log.mining.strategy": "online_catalog",
+        "transforms": "unwrap,route",
+        "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+        "transforms.unwrap.delete.handling.mode": "drop",
+        "transforms.unwrap.drop.tombstones": "false",
+        "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+        "transforms.route.regex": "([^.]+)\\.([^.]+)\\.([^.]+)",
+        "transforms.route.replacement": "$3_DOC_DEBUG"
+    }
+}
